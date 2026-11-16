@@ -1,8 +1,15 @@
 package pool
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 var urls = []string{
@@ -20,7 +27,7 @@ func TestNextRotatesInOrder(t *testing.T) {
 	// Two full laps: 8081, 8082, 8083, 8081, 8082, 8083.
 	for i := 0; i < 6; i++ {
 		want := urls[i%len(urls)]
-		if got := p.Next().URL.String(); got != want {
+		if got := p.Next(nil).URL.String(); got != want {
 			t.Errorf("pick %d: got %s, want %s", i, got, want)
 		}
 	}
@@ -47,7 +54,7 @@ func TestNextIsEvenUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			local := map[string]int{}
 			for i := 0; i < picksEach; i++ {
-				local[p.Next().URL.Host]++
+				local[p.Next(nil).URL.Host]++
 			}
 			mu.Lock()
 			for host, n := range local {
@@ -78,4 +85,205 @@ func TestNewRejectsBadInput(t *testing.T) {
 			t.Errorf("%s: expected an error for %v", name, in)
 		}
 	}
+}
+
+// A dead backend's traffic must be shared evenly, not all dumped on
+// whichever backend happens to come after it in the list.
+func TestNextSharesDeadBackendsTrafficEvenly(t *testing.T) {
+	p, err := New(urls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Backends()[1].SetAlive(false, "test")
+
+	counts := map[string]int{}
+	for i := 0; i < 3000; i++ {
+		counts[p.Next(nil).URL.Host]++
+	}
+	if counts["localhost:8082"] != 0 {
+		t.Errorf("dead backend got %d picks", counts["localhost:8082"])
+	}
+	if counts["localhost:8081"] != 1500 || counts["localhost:8083"] != 1500 {
+		t.Errorf("uneven split: %v", counts)
+	}
+}
+
+func TestNextReturnsNilWhenNothingAvailable(t *testing.T) {
+	p, err := New(urls[:2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Backends()[0].SetAlive(false, "test")
+	if b := p.Next(map[*Backend]bool{p.Backends()[1]: true}); b != nil {
+		t.Errorf("got %s, want nil", b.URL)
+	}
+}
+
+// The health checker writes alive while requests read it. This test exists
+// for `go test -race`.
+func TestAliveIsSafeUnderConcurrency(t *testing.T) {
+	p, err := New(urls)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 20; g++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				p.Next(nil)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				p.Backends()[i%3].alive.Store(i%2 == 0)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// startBackend runs a test server that says its name and counts its requests.
+func startBackend(t *testing.T, name string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		io.WriteString(w, name)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// deadURL returns the address of a server that has already shut down, so
+// connecting to it fails straight away.
+func deadURL() string {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u := srv.URL
+	srv.Close()
+	return u
+}
+
+func do(t *testing.T, h http.Handler, method string, body io.Reader) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, "/x", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// The point of phase 3: the client never finds out a backend died.
+func TestRetriesGetOnAnotherBackend(t *testing.T) {
+	live, _ := startBackend(t, "live")
+	p, err := New([]string{deadURL(), live.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round robin starts at the dead backend, so this request hits it first.
+	rec := do(t, p, http.MethodGet, nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != "live" {
+		t.Errorf("got %d %q, want 200 \"live\"", rec.Code, rec.Body.String())
+	}
+	if p.Backends()[0].IsAlive() {
+		t.Error("dead backend should have been taken out of rotation")
+	}
+}
+
+func TestDoesNotRetryPost(t *testing.T) {
+	live, hits := startBackend(t, "live")
+	p, err := New([]string{deadURL(), live.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := do(t, p, http.MethodPost, strings.NewReader("order=1"))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("got %d, want 502", rec.Code)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("POST was retried: live backend got %d requests", hits.Load())
+	}
+}
+
+func TestAllBackendsDownIs503(t *testing.T) {
+	p, err := New([]string{deadURL(), deadURL()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, p, http.MethodGet, nil); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want 503", rec.Code)
+	}
+}
+
+// A client hanging up isn't the backend's fault.
+func TestClientCancelKeepsBackendAlive(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	p, err := New([]string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+	go func() {
+		<-entered
+		cancel()
+	}()
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !p.Backends()[0].IsAlive() {
+		t.Error("backend was marked down because the client went away")
+	}
+}
+
+func TestHealthCheckTakesBackendsOutAndBringsThemBack(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(false)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			t.Errorf("health check hit %s", r.URL.Path)
+		}
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := New([]string{srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := p.Backends()[0]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.HealthCheck(ctx, "/healthz", 10*time.Millisecond, time.Second)
+
+	waitFor(t, func() bool { return !b.IsAlive() }, "backend to go down")
+	healthy.Store(true)
+	waitFor(t, b.IsAlive, "backend to come back")
+}
+
+func waitFor(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
