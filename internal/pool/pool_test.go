@@ -19,7 +19,7 @@ var urls = []string{
 }
 
 func TestNextRotatesInOrder(t *testing.T) {
-	p, err := New(urls)
+	p, err := New(urls, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestNextRotatesInOrder(t *testing.T) {
 // Many goroutines picking at once must still spread picks perfectly evenly.
 // Run with `go test -race` to also check for data races.
 func TestNextIsEvenUnderConcurrency(t *testing.T) {
-	p, err := New(urls)
+	p, err := New(urls, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestNewRejectsBadInput(t *testing.T) {
 		"one bad one": {"http://localhost:8081", "nope"},
 	}
 	for name, in := range cases {
-		if _, err := New(in); err == nil {
+		if _, err := New(in, RoundRobin); err == nil {
 			t.Errorf("%s: expected an error for %v", name, in)
 		}
 	}
@@ -90,7 +90,7 @@ func TestNewRejectsBadInput(t *testing.T) {
 // A dead backend's traffic must be shared evenly, not all dumped on
 // whichever backend happens to come after it in the list.
 func TestNextSharesDeadBackendsTrafficEvenly(t *testing.T) {
-	p, err := New(urls)
+	p, err := New(urls, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestNextSharesDeadBackendsTrafficEvenly(t *testing.T) {
 }
 
 func TestNextReturnsNilWhenNothingAvailable(t *testing.T) {
-	p, err := New(urls[:2])
+	p, err := New(urls[:2], RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestNextReturnsNilWhenNothingAvailable(t *testing.T) {
 // The health checker writes alive while requests read it. This test exists
 // for `go test -race`.
 func TestAliveIsSafeUnderConcurrency(t *testing.T) {
-	p, err := New(urls)
+	p, err := New(urls, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func do(t *testing.T, h http.Handler, method string, body io.Reader) *httptest.R
 // The point of phase 3: the client never finds out a backend died.
 func TestRetriesGetOnAnotherBackend(t *testing.T) {
 	live, _ := startBackend(t, "live")
-	p, err := New([]string{deadURL(), live.URL})
+	p, err := New([]string{deadURL(), live.URL}, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestRetriesGetOnAnotherBackend(t *testing.T) {
 
 func TestDoesNotRetryPost(t *testing.T) {
 	live, hits := startBackend(t, "live")
-	p, err := New([]string{deadURL(), live.URL})
+	p, err := New([]string{deadURL(), live.URL}, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestDoesNotRetryPost(t *testing.T) {
 }
 
 func TestAllBackendsDownIs503(t *testing.T) {
-	p, err := New([]string{deadURL(), deadURL()})
+	p, err := New([]string{deadURL(), deadURL()}, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestClientCancelKeepsBackendAlive(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(release) })
 
-	p, err := New([]string{srv.URL})
+	p, err := New([]string{srv.URL}, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestHealthCheckTakesBackendsOutAndBringsThemBack(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	p, err := New([]string{srv.URL})
+	p, err := New([]string{srv.URL}, RoundRobin)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,4 +286,134 @@ func waitFor(t *testing.T, cond func() bool, what string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestNewRejectsUnknownStrategy(t *testing.T) {
+	if _, err := New(urls, "random"); err == nil {
+		t.Error("expected an error for an unknown strategy")
+	}
+}
+
+func TestLeastConnectionsPicksTheLeastBusy(t *testing.T) {
+	p, err := New(urls, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := p.Backends()
+	b[0].active.Store(5)
+	b[1].active.Store(1)
+	b[2].active.Store(3)
+
+	for i := 0; i < 10; i++ {
+		if got := p.Next(nil); got != b[1] {
+			t.Fatalf("pick %d: got %s (in flight %d), want %s", i, got.URL, got.Active(), b[1].URL)
+		}
+	}
+}
+
+// When every backend is equally busy, least connections must share requests
+// out in turn, not send them all to the first backend in the list.
+func TestLeastConnectionsSharesTiesInTurn(t *testing.T) {
+	p, err := New(urls, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for i := 0; i < 300; i++ {
+		counts[p.Next(nil).URL.Host]++
+	}
+	for _, u := range p.Backends() {
+		if counts[u.URL.Host] != 100 {
+			t.Errorf("idle backends shared unevenly: %v", counts)
+			break
+		}
+	}
+}
+
+func TestLeastConnectionsSkipsDeadBackends(t *testing.T) {
+	p, err := New(urls, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := p.Backends()
+	b[0].active.Store(9)
+	b[2].active.Store(9)
+	b[1].SetAlive(false, "test") // the least busy, but dead
+
+	if got := p.Next(nil); got == b[1] {
+		t.Error("picked a dead backend")
+	}
+}
+
+// The in-flight count must go back to zero after each request, including
+// one that failed and was retried elsewhere.
+func TestInFlightCountReturnsToZero(t *testing.T) {
+	live, _ := startBackend(t, "live")
+	p, err := New([]string{deadURL(), live.URL}, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		do(t, p, http.MethodGet, nil)
+	}
+	for _, b := range p.Backends() {
+		if b.Active() != 0 {
+			t.Errorf("%s still has %d in flight", b.URL, b.Active())
+		}
+	}
+}
+
+// While a request is being handled, its backend counts it as in flight, so
+// least connections sends the next request elsewhere.
+func TestInFlightRequestSteersTheNextOneAway(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+	}))
+	t.Cleanup(slow.Close)
+	fast, _ := startBackend(t, "fast")
+
+	p, err := New([]string{slow.URL, fast.URL}, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		do(t, p, http.MethodGet, nil) // ties go in turn, so this one goes to slow
+		close(done)
+	}()
+	<-entered
+
+	if p.Backends()[0].Active() != 1 {
+		t.Fatalf("slow backend in flight = %d, want 1", p.Backends()[0].Active())
+	}
+	for i := 0; i < 5; i++ {
+		if got := p.Next(nil); got != p.Backends()[1] {
+			t.Errorf("pick %d went to the busy backend", i)
+		}
+	}
+	close(release)
+	<-done
+}
+
+// With one backend busy, the idle ones must split its share evenly between
+// them, not hand it all to whichever comes first in the list.
+func TestLeastConnectionsSharesTiesFairlyAroundABusyBackend(t *testing.T) {
+	p, err := New(urls, LeastConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := p.Backends()[2]
+	busy.active.Store(4)
+
+	counts := map[string]int{}
+	for i := 0; i < 300; i++ {
+		counts[p.Next(nil).URL.Host]++
+	}
+	if counts[busy.URL.Host] != 0 || counts["localhost:8081"] != 150 || counts["localhost:8082"] != 150 {
+		t.Errorf("uneven split around a busy backend: %v", counts)
+	}
 }

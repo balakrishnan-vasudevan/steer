@@ -20,6 +20,15 @@ type Backend struct {
 	// alive is read by every request and written by the health checker,
 	// often at the same moment, so it has to be atomic.
 	alive atomic.Bool
+
+	// active counts requests this backend is handling right now. Every
+	// request changes it on the way in and out, so it's atomic too.
+	active atomic.Int64
+}
+
+// Active reports how many requests this backend is handling right now.
+func (b *Backend) Active() int64 {
+	return b.active.Load()
 }
 
 // IsAlive reports whether this backend is currently in rotation.
@@ -41,21 +50,35 @@ func (b *Backend) SetAlive(alive bool, reason string) {
 	log.Printf("backend %s is %s (%s)", b.URL, state, reason)
 }
 
-// Pool is a fixed list of backends picked in round-robin order, skipping any
-// that are down. It is safe to use from many goroutines at once.
+// Strategy is how the pool picks a backend for each request.
+type Strategy string
+
+const (
+	// RoundRobin takes the backends in turn, regardless of how busy they are.
+	RoundRobin Strategy = "round-robin"
+	// LeastConnections picks the backend with the fewest requests in flight.
+	LeastConnections Strategy = "least-conn"
+)
+
+// Pool is a fixed list of backends, skipping any that are down. It is safe
+// to use from many goroutines at once.
 type Pool struct {
 	backends []*Backend
+	strategy Strategy
 	next     atomic.Uint64 // how many picks have been made so far
 }
 
 // New builds a pool from backend URLs like "http://localhost:8081".
 // Backends start out alive; the health checker corrects that within one check.
-func New(rawURLs []string) (*Pool, error) {
+func New(rawURLs []string, strategy Strategy) (*Pool, error) {
 	if len(rawURLs) == 0 {
 		return nil, errors.New("pool needs at least one backend")
 	}
+	if strategy != RoundRobin && strategy != LeastConnections {
+		return nil, fmt.Errorf("unknown strategy %q (want %q or %q)", strategy, RoundRobin, LeastConnections)
+	}
 
-	p := &Pool{}
+	p := &Pool{strategy: strategy}
 	for _, raw := range rawURLs {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -93,10 +116,34 @@ func (p *Pool) Next(tried map[*Backend]bool) *Backend {
 	}
 
 	n := p.next.Add(1) - 1
-	return available[n%uint64(len(available))]
+	if p.strategy == RoundRobin {
+		return available[n%uint64(len(available))]
+	}
+
+	// Least connections: the backends with the fewest requests in flight.
+	// Read each count once, because they change while we look.
+	counts := make([]int64, len(available))
+	fewest := int64(-1)
+	for i, b := range available {
+		counts[i] = b.Active()
+		if fewest < 0 || counts[i] < fewest {
+			fewest = counts[i]
+		}
+	}
+
+	// Several backends are often tied (all idle, say). Take turns among the
+	// tied ones. Just picking the first would hand every tie to whichever
+	// backend comes first in the list.
+	tied := make([]*Backend, 0, len(available))
+	for i, b := range available {
+		if counts[i] == fewest {
+			tied = append(tied, b)
+		}
+	}
+	return tied[n%uint64(len(tied))]
 }
 
-// Backends returns the backends in the pool, in round-robin order.
+// Backends returns the backends in the pool, in the order they were given.
 func (p *Pool) Backends() []*Backend {
 	return p.backends
 }

@@ -25,10 +25,10 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		tried[b] = true
 
-		log.Printf("%s %s -> %s", r.Method, r.URL.Path, b.URL)
+		log.Printf("%s %s -> %s (in flight: %d)", r.Method, r.URL.Path, b.URL, b.Active())
 		var failed error
 		ctx := context.WithValue(r.Context(), failureKey{}, &failed)
-		b.Proxy.ServeHTTP(w, r.WithContext(ctx))
+		b.serve(w, r.WithContext(ctx))
 		if failed == nil {
 			return
 		}
@@ -60,4 +60,14 @@ func retryable(r *http.Request) bool {
 		return r.ContentLength == 0
 	}
 	return false
+}
+
+// serve forwards one request to b, counting it as in flight while it runs.
+// The decrement is deferred so it happens however the call ends, including
+// the panic net/http uses to abort a response. A count that only ever went
+// up would make the backend look permanently busy.
+func (b *Backend) serve(w http.ResponseWriter, r *http.Request) {
+	b.active.Add(1)
+	defer b.active.Add(-1)
+	b.Proxy.ServeHTTP(w, r)
 }
